@@ -7,13 +7,13 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -26,6 +26,13 @@ type Raft struct {
 	persister *tester.Persister   // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	//Write-Ahead Logging (WAL)
+	//这个原则实际上来自数据库系统的 Write-Ahead Logging 概念：
+	//
+	//- 规则 ：在修改数据之前，必须先将修改记录写入日志
+	//- 目的 ：确保即使在崩溃时也能恢复到一致状态
+	//- 在 Raft 中 ：在响应 RPC 之前，必须先持久化状态变化
+	//也就是持久化变量一旦变化就要持久化，且要加锁，且持久化才能发送信息
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
@@ -52,6 +59,10 @@ type Raft struct {
 	appendInProgress bool
 
 	ApplyCh chan raftapi.ApplyMsg
+
+	// 条件变量用于applier函数的优化
+	applyCond *sync.Cond
+	applyMu   sync.Mutex // applier专用锁，避免与rf.mu冲突
 }
 
 type LogEntry struct {
@@ -84,13 +95,13 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.Logs)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -99,18 +110,21 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data) //将静态的字节切片转换为可读取的流。
+	d := labgob.NewDecoder(r)  //创建一个能理解特定编码规则的解释器
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.Logs = logs
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -141,6 +155,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	XTerm  int // 冲突条目的任期号
+	XIndex int // 该任期的第一个条目索引
+	XLen   int // 日志长度
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -173,7 +191,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 检查指定位置的日志条目是否匹配
 		if rf.Logs[args.PrevLogIndex].Term == args.PrevLogTerm {
 			logConsistent = true
+		} else {
+			// 日志不一致，设置快速回退优化字段
+			reply.XTerm = rf.Logs[args.PrevLogIndex].Term
+			reply.XIndex = args.PrevLogIndex
+			// 找到该任期的第一个条目
+			for i := args.PrevLogIndex; i >= 0; i-- {
+				if rf.Logs[i].Term != reply.XTerm {
+					reply.XIndex = i + 1
+					break
+				}
+				if i == 0 {
+					reply.XIndex = 0
+				}
+			}
 		}
+	} else {
+		// PrevLogIndex 超出日志范围，follower 的日志太短
+		reply.XLen = len(rf.Logs)
 	}
 
 	//开始日志复制
@@ -183,6 +218,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.Logs = rf.Logs[:args.PrevLogIndex+1]
 			// 追加所有新的日志条目
 			rf.Logs = append(rf.Logs, args.Entries...)
+			rf.persist()
 			reply.Success = true
 			DPrintf("[%d] Appended entries from leader %d, log length: %d\n", rf.me, args.LeaderId, len(rf.Logs))
 		}
@@ -197,6 +233,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.CommitIndex && reply.Success {
 		rf.CommitIndex = min(args.LeaderCommit, rf.GetLogsLastIndex())
 		DPrintf("[%d] Updated commitIndex to %d\n", rf.me, rf.CommitIndex)
+		// 通知applier有新的日志可以应用
+		rf.applyCond.Signal()
 	}
 }
 
@@ -277,6 +315,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//所有的选举通过
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
+	rf.persist()
 	DPrintf("[%d] Voted for %d in term %d\n", rf.me, rf.votedFor, rf.currentTerm)
 }
 
@@ -284,6 +323,7 @@ func (rf *Raft) ToFollower(Term int) {
 	rf.currentTerm = Term
 	rf.votedFor = -1
 	rf.State = -1
+	rf.persist()
 	rf.ElectionTimeout = time.Duration(150+rand.Intn(150)) * time.Millisecond
 	DPrintf("[%d] -> Follower, term=%d\n", rf.me, rf.currentTerm)
 }
@@ -304,9 +344,30 @@ func (rf *Raft) ToLeader() {
 }
 
 func (rf *Raft) applier() {
-	for !rf.killed() {
-		rf.mu.Lock()
+	rf.applyMu.Lock()
+	defer rf.applyMu.Unlock()
 
+	for !rf.killed() {
+		// 等待条件：有新的日志需要应用
+		for !rf.killed() {
+			rf.mu.Lock()
+			hasNewLogs := rf.LastApplied < rf.CommitIndex
+			rf.mu.Unlock()
+
+			if hasNewLogs {
+				break // 有新日志，跳出等待循环
+			}
+
+			// 没有新日志，等待条件变量信号
+			rf.applyCond.Wait()
+		}
+
+		if rf.killed() {
+			break
+		}
+
+		// 应用日志
+		rf.mu.Lock()
 		var applyMsg raftapi.ApplyMsg
 		needApply := false
 
@@ -321,9 +382,10 @@ func (rf *Raft) applier() {
 		rf.mu.Unlock()
 
 		if needApply {
+			// 临时释放锁来发送消息，避免死锁
+			rf.applyMu.Unlock()
 			rf.ApplyCh <- applyMsg
-		} else {
-			time.Sleep(5 * time.Millisecond)
+			rf.applyMu.Lock()
 		}
 	}
 }
@@ -396,13 +458,37 @@ func (rf *Raft) LeaderAppendEntries() {
 						rf.MatchIndex[i] = rf.NextIndex[i] - 1
 						DPrintf("[%d] Replicated to %d, nextIndex=%d\n", rf.me, i, rf.NextIndex[i])
 					} else {
-						if rf.NextIndex[i] > 1 {
-							rf.NextIndex[i]--
-							DPrintf("[%d] NeedCycle to %d\n", rf.me, rf.NextIndex[i])
-							// 重新检查状态，确保仍然是leader
-							if rf.State == 1 {
-								needCycle = true
+						// 使用快速回退优化
+						if reply.XLen > 0 {
+							// 情况3：follower的日志太短
+							rf.NextIndex[i] = reply.XLen
+						} else if reply.XTerm > 0 { //这里其实也是else
+							// 查找leader是否有XTerm
+							hasXTerm := false
+							lastXTermIndex := -1
+							for j := len(rf.Logs) - 1; j >= 0; j-- {
+								if rf.Logs[j].Term == reply.XTerm {
+									hasXTerm = true
+									lastXTermIndex = j
+									break
+								}
 							}
+
+							if hasXTerm {
+								// 情况2：leader有XTerm
+								rf.NextIndex[i] = lastXTermIndex + 1
+							} else {
+								// 情况1：leader没有XTerm
+								rf.NextIndex[i] = reply.XIndex
+							}
+						}
+
+						DPrintf("[%d] Fast backup to %d, XTerm=%d, XIndex=%d, XLen=%d\n",
+							rf.me, rf.NextIndex[i], reply.XTerm, reply.XIndex, reply.XLen)
+
+						// 重新检查状态，确保仍然是leader
+						if rf.State == 1 {
+							needCycle = true
 						}
 					}
 					rf.mu.Unlock()
@@ -453,6 +539,8 @@ func (rf *Raft) LeaderAppendEntries() {
 			//}
 			rf.CommitIndex = r
 			DPrintf("[%d] Advanced commitIndex to %d\n", rf.me, rf.CommitIndex)
+			// 通知applier有新的日志可以应用
+			rf.applyCond.Signal()
 		}
 		rf.mu.Unlock()
 	}
@@ -515,6 +603,7 @@ func (rf *Raft) ToCandidate() {
 	rf.State = 0
 	rf.votedFor = rf.me
 	rf.currentTerm++
+	rf.persist()
 	DPrintf("[%d] -> Candidate, term=%d\n", rf.me, rf.currentTerm)
 }
 
@@ -598,7 +687,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
+	// 唤醒可能在等待的applier goroutine
+	rf.applyCond.Signal()
 }
 
 func (rf *Raft) killed() bool {
@@ -741,6 +831,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.MatchIndex = make([]int, len(rf.peers))
 	rf.NextIndex = make([]int, len(rf.peers))
 	rf.ApplyCh = applyCh
+
+	// 初始化条件变量
+	rf.applyCond = sync.NewCond(&rf.applyMu)
 
 	rf.Heartbeat = time.Now()
 	rf.ElectionTimeout = time.Duration(150+rand.Intn(150)) * time.Millisecond
