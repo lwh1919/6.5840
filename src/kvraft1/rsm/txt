@@ -13,9 +13,6 @@ import (
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
 
-//每个台服务器都是一个 状态机（数据库）+ rsm（被封装的数据管家）+ raft算法-rpc调用（保证数据一致性）
-
-// op-operation 也就是对rsm的一次操作的封装，通过id来找 响应
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -41,27 +38,30 @@ type StateMachine interface {
 	Restore([]byte)
 }
 
-// 日志复制中间器的抽象
 type RSM struct {
 	mu           sync.Mutex
 	me           int
-	rf           raftapi.Raft          //rf节点，是leader就操作，不会就重定向到raft
-	applyCh      chan raftapi.ApplyMsg //接收leader的反馈
-	maxraftstate int                   // snapshot if log grows this big
+	rf           raftapi.Raft
+	applyCh      chan raftapi.ApplyMsg
+	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	nextId      int64
-	mapChan     map[int]*OPrsChan
-	lastApplied int
+	nextOpId     int64                       // 下一个操作ID
+	pendingOps   map[int]*PendingOp          // 等待结果的操作: index -> pending op info
+	lastApplied  int                         // 最后应用的日志索引
 }
-type OPrsChan struct {
-	Opid     int64
-	Term     int
-	ResultCh chan OpResult
+
+// PendingOp 存储等待结果的操作信息
+type PendingOp struct {
+	OpId     int64          // 期望的操作ID
+	Term     int            // 提交时的term
+	ResultCh chan OpResult  // 结果channel
 }
+
+// OpResult 封装操作的执行结果
 type OpResult struct {
-	V   any // DoOp()的返回值
-	Err rpc.Err
+	Value any     // DoOp()的返回值
+	Err   rpc.Err // 错误信息
 }
 
 // servers[] contains the ports of the set of
@@ -98,67 +98,18 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
-		nextId:       0,
-		mapChan:      make(map[int]*OPrsChan),
+		nextOpId:     0,
+		pendingOps:   make(map[int]*PendingOp),
 		lastApplied:  0,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
 
+	// 启动reader goroutine来处理已提交的操作
 	go rsm.reader()
 
 	return rsm
-}
-
-func (rsm *RSM) reader() {
-	for msg := range rsm.applyCh { //go特色语法糖
-		if !msg.CommandValid {
-			continue
-		}
-
-		rsm.mu.Lock()
-
-		//rsm.rf.mu.Lock() mu不可道出涅
-		//term, _ := rsm.rf.GetState()
-
-		//
-		op, ok := msg.Command.(Op)
-		if !ok {
-			rsm.mu.Unlock()
-			continue
-		}
-
-		// 调用StateMachine的DoOp执行操作
-		value := rsm.sm.DoOp(op.Req)
-
-		rsm.lastApplied = msg.CommandIndex
-
-		//阻塞
-		if opres, chankaiguan := rsm.mapChan[msg.CommandIndex]; chankaiguan {
-			//检查是否是(通道和msg是不是对应的涅)期望操作
-			var ressult OpResult
-			if opres.Opid == op.Id {
-				ressult = OpResult{
-					V:   value,
-					Err: rpc.OK,
-				}
-
-			} else {
-				ressult = OpResult{
-					V:   nil,
-					Err: rpc.ErrWrongLeader,
-				}
-			}
-			//非阻塞发送
-			select {
-			case opres.ResultCh <- ressult:
-			default:
-			}
-
-		}
-		rsm.mu.Unlock()
-	}
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
@@ -173,50 +124,117 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// Submit creates an Op structure to run a command through Raft;
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
+
+	// your code here
 	rsm.mu.Lock()
-	gg := rsm.nextId
-	opReq := Op{
-		Id:  rsm.nextId,
+	opId := rsm.nextOpId
+	rsm.nextOpId++
+	op := Op{
+		Id:  opId,
 		Req: req,
 	}
-	rsm.nextId++
 	rsm.mu.Unlock()
 
-	index, term, isLeader := rsm.rf.Start(opReq)
+	// 调用Raft的Start()提交操作
+	index, term, isLeader := rsm.rf.Start(op)
 	if !isLeader {
 		return rpc.ErrWrongLeader, nil
 	}
-	//创建接收通道
+
+	// 创建channel等待结果
 	rsm.mu.Lock()
-	resChan := make(chan OpResult, 1) //细节是1，和非阻塞相对应
-	rsm.mapChan[index] = &OPrsChan{
-		Opid:     opReq.Id,
+	resultCh := make(chan OpResult, 1)
+	rsm.pendingOps[index] = &PendingOp{
+		OpId:     opId,
 		Term:     term,
-		ResultCh: resChan,
+		ResultCh: resultCh,
 	}
 	rsm.mu.Unlock()
 
-	// 同时定期检查term是否改变（说明leader已改变）,只想leader写操作
+	// 等待操作被提交并执行
+	// 同时定期检查term是否改变（说明leadership已改变）
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case res := <-resChan:
+		case result := <-resultCh:
 			rsm.mu.Lock()
-			delete(rsm.mapChan, int(gg))
+			delete(rsm.pendingOps, index)
 			rsm.mu.Unlock()
-			return res.Err, res.V
+			return result.Err, result.Value
 
 		case <-ticker.C:
-
-			nowTerm, isLeader := rsm.rf.GetState()
-			if !isLeader || nowTerm != term {
+			// 定期检查term是否改变
+			currentTerm, isLeader := rsm.rf.GetState()
+			if !isLeader || currentTerm != term {
+				// Leadership已改变，清理并返回错误
 				rsm.mu.Lock()
-				delete(rsm.mapChan, int(gg))
+				delete(rsm.pendingOps, index)
 				rsm.mu.Unlock()
 				return rpc.ErrWrongLeader, nil
 			}
+		}
+	}
+}
+
+// reader goroutine从applyCh读取已提交的操作并执行
+func (rsm *RSM) reader() {
+	for msg := range rsm.applyCh {
+		if msg.CommandValid {
+			rsm.mu.Lock()
+
+			// 获取当前term
+			term, _ := rsm.rf.GetState()
+
+			// 执行操作
+			op, ok := msg.Command.(Op)
+			if !ok {
+				rsm.mu.Unlock()
+				continue
+			}
+
+			// 调用StateMachine的DoOp执行操作
+			value := rsm.sm.DoOp(op.Req)
+
+			// 更新lastApplied
+			rsm.lastApplied = msg.CommandIndex
+
+			// 通知等待的Submit()调用
+			if pendingOp, exists := rsm.pendingOps[msg.CommandIndex]; exists {
+				// 检查是否是期望的操作
+				if pendingOp.OpId == op.Id && pendingOp.Term == term {
+					// 操作匹配，返回成功结果
+					result := OpResult{
+						Value: value,
+						Err:   rpc.OK,
+					}
+					// 非阻塞发送
+					select {
+					case pendingOp.ResultCh <- result:
+					default:
+					}
+				} else {
+					// 操作不匹配（leadership已改变），返回错误
+					result := OpResult{
+						Value: nil,
+						Err:   rpc.ErrWrongLeader,
+					}
+					// 非阻塞发送
+					select {
+					case pendingOp.ResultCh <- result:
+					default:
+					}
+				}
+			}
+
+			rsm.mu.Unlock()
+		} else if msg.SnapshotValid {
+			// Part C will handle snapshots
+			rsm.mu.Lock()
+			rsm.sm.Restore(msg.Snapshot)
+			rsm.lastApplied = msg.SnapshotIndex
+			rsm.mu.Unlock()
 		}
 	}
 }
