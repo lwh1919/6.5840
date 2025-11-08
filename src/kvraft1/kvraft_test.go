@@ -9,7 +9,7 @@ import (
 
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
 )
 
@@ -112,7 +112,7 @@ func (ts *Test) GenericTest() {
 			if sz > 8*ts.maxraftstate {
 				err := fmt.Sprintf("logs were not trimmed (%v > 8*%v)", sz, ts.maxraftstate)
 				tester.AnnotateCheckerFailure(err, err)
-				ts.t.Fatalf(err)
+				ts.t.Fatalf("%s", err)
 			}
 		}
 		if ts.maxraftstate < 0 {
@@ -121,7 +121,7 @@ func (ts *Test) GenericTest() {
 			if ssz > 0 {
 				err := fmt.Sprintf("snapshot too large (%v), should not be used when maxraftstate = %d", ssz, ts.maxraftstate)
 				tester.AnnotateCheckerFailure(err, err)
-				ts.t.Fatalf(err)
+				ts.t.Fatalf("%s", err)
 			}
 		}
 	}
@@ -238,11 +238,11 @@ func TestOnePartition4B(t *testing.T) {
 	case ver := <-done0:
 		err := fmt.Sprintf("Put in minority completed with version = %v", ver)
 		tester.AnnotateCheckerFailure(err, err)
-		t.Fatalf(err)
+		t.Fatalf("%s", err)
 	case ver := <-done1:
 		err := fmt.Sprintf("Get in minority completed with version = %v", ver)
 		tester.AnnotateCheckerFailure(err, err)
-		t.Fatalf(err)
+		t.Fatalf("%s", err)
 	case <-time.After(time.Second):
 	}
 	tester.AnnotateCheckerSuccess(
@@ -375,7 +375,7 @@ func TestSnapshotRPC4C(t *testing.T) {
 	if sz > 8*ts.maxraftstate {
 		err := fmt.Sprintf("logs were not trimmed (%v > 8*%v)", sz, ts.maxraftstate)
 		tester.AnnotateCheckerFailure(err, err)
-		t.Fatalf(err)
+		t.Fatalf("%s", err)
 	}
 
 	// now make group that requires participation of
@@ -427,7 +427,7 @@ func TestSnapshotSize4C(t *testing.T) {
 	if sz > 8*ts.maxraftstate {
 		err := fmt.Sprintf("logs were not trimmed (%v > 8*%v)", sz, ts.maxraftstate)
 		tester.AnnotateCheckerFailure(err, err)
-		t.Fatalf(err)
+		t.Fatalf("%s", err)
 	}
 
 	// check that the snapshots are not unreasonably large
@@ -435,7 +435,7 @@ func TestSnapshotSize4C(t *testing.T) {
 	if ssz > maxsnapshotstate {
 		err := fmt.Sprintf("snapshot too large (%v > %v)", ssz, maxsnapshotstate)
 		tester.AnnotateCheckerFailure(err, err)
-		t.Fatalf(err)
+		t.Fatalf("%s", err)
 	}
 }
 

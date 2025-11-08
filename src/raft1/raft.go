@@ -154,6 +154,12 @@ func (rf *Raft) PersistBytes() int {
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
+// 创建快照并压缩日志：
+// 检查快照索引是否有效（不能比现有快照旧，不能超过最后日志）
+// 获取快照位置的任期号
+// 创建新的日志数组，保留虚拟节点和快照之后的日志
+// 更新快照状态
+// 持久化新状态
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 	rf.mu.Lock()
@@ -206,6 +212,7 @@ type ReplySnapshot struct {
 
 // 严重落后的时候传日志
 func (rf *Raft) InstallSnapshot(args *RequestSnapshot, reply *ReplySnapshot) {
+	//但是还是要做检验，万一这个请求很落后呢
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm

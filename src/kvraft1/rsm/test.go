@@ -2,15 +2,15 @@ package rsm
 
 import (
 	//"log"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
-	"fmt"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Test struct {
@@ -127,7 +127,7 @@ func (ts *Test) checkCounter(v int, nsrv int) {
 	}
 	err := fmt.Sprintf("checkCounter: only %d srvs have %v instead of %d", n, v, nsrv)
 	tester.AnnotateCheckerFailure(err, err)
-	ts.Fatalf(err)
+	ts.Fatalf("%s", err)
 }
 
 func (ts *Test) countValue(v int) int {

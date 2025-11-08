@@ -6,9 +6,9 @@ import (
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
@@ -117,49 +117,54 @@ func (rsm *RSM) reader() {
 			continue
 		}
 
-		rsm.mu.Lock()
-
-		//rsm.rf.mu.Lock() mu不可道出涅
-		//term, _ := rsm.rf.GetState()
-
-		//
 		op, ok := msg.Command.(Op)
 		if !ok {
-			rsm.mu.Unlock()
 			continue
 		}
 
-		// 调用StateMachine的DoOp执行操作
+		// 调用StateMachine的DoOp执行操作 - 不持有锁避免死锁
 		value := rsm.sm.DoOp(op.Req)
 
+		rsm.mu.Lock()
 		rsm.lastApplied = msg.CommandIndex
 
-		//阻塞
-		if opres, chankaiguan := rsm.mapChan[msg.CommandIndex]; chankaiguan {
-			//检查是否是(通道和msg是不是对应的涅)期望操作
+		var opres *OPrsChan
+		if found, exists := rsm.mapChan[msg.CommandIndex]; exists {
+			opres = found
+		}
+		rsm.mu.Unlock()
+
+		// 在锁外发送结果，避免死锁
+		if opres != nil {
+			// 检查操作ID是否匹配
 			var ressult OpResult
 			if opres.Opid == op.Id {
+				// 发送成功结果
 				ressult = OpResult{
 					V:   value,
 					Err: rpc.OK,
 				}
-
 			} else {
+				// 如果ID不匹配，发送错误让Submit继续
 				ressult = OpResult{
 					V:   nil,
 					Err: rpc.ErrWrongLeader,
 				}
 			}
-			//非阻塞发送
-			select {
-			case opres.ResultCh <- ressult:
-			default:
-			}
-
+			opres.ResultCh <- ressult
 		}
-		rsm.mu.Unlock()
 	}
 }
+
+// 关于	if opres.Opid == op.Id ，我原本有以下疑问 ,他只能防止同一个操作A的重复提交
+// 集群有两台服务器，分别运行 RSM-A（原 Leader 节点）和 RSM-B（新 Leader 节点）。
+// RSM-A 提交操作 OpA，生成 Id = 10，把它交给原 Leader 的 Raft（假设 index = 42）。
+// 原 Leader 在多数派提交之前就挂了。
+// RSM-B 成为新 Leader，并提交自己的操作 OpB，它的 nextId 恰好也跑到了 10，于是 OpB.Id = 10。新 Leader 提交成功，把日志写到了 index = 42。
+// 问题：当 RSM-A 恢复时，Raft 会把 index = 42 的日志应用给它，里头的 Command 等于 OpB{Id:10, ...}。RSM-A 的 reader() 收到这个消息时，发现 mapChan[42].Opid 埋的是 10（提交 OpA 时记录的），而 op.Id 也等于 10（这是 OpB），两者相等，于是这个判断会进入“发送成功结果”。看起来 RSM-A 就会错把 OpB 当成自己的结果返回给客户端。
+// 但是实际上不会出现这种情况
+// Submit() 定期检查是否还是 Leader；一旦掉队就清理 mapChan[index]，返回 ErrWrongLeader，客户端重新找 Leader。
+// 日志应用到旧 Leader 时，mapChan[index] 已经不存在（或在未来几毫秒内被删除），reader() 自然不会把 OpB 的结果发回给 OpA 的客户端。
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
@@ -174,7 +179,6 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
 	rsm.mu.Lock()
-	gg := rsm.nextId
 	opReq := Op{
 		Id:  rsm.nextId,
 		Req: req,
@@ -197,26 +201,33 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.mu.Unlock()
 
 	// 同时定期检查term是否改变（说明leader已改变）,只想leader写操作
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(1 * time.Millisecond)
+	timeout := time.After(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case res := <-resChan:
 			rsm.mu.Lock()
-			delete(rsm.mapChan, int(gg))
+			delete(rsm.mapChan, index)
 			rsm.mu.Unlock()
 			return res.Err, res.V
 
 		case <-ticker.C:
-
 			nowTerm, isLeader := rsm.rf.GetState()
 			if !isLeader || nowTerm != term {
 				rsm.mu.Lock()
-				delete(rsm.mapChan, int(gg))
+				delete(rsm.mapChan, index)
 				rsm.mu.Unlock()
 				return rpc.ErrWrongLeader, nil
 			}
+
+		case <-timeout:
+			// 超时：清理并返回错误
+			rsm.mu.Lock()
+			delete(rsm.mapChan, index)
+			rsm.mu.Unlock()
+			return rpc.ErrWrongLeader, nil
 		}
 	}
 }
