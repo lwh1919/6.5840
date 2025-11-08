@@ -1,19 +1,30 @@
 package kvsrv
 
 import (
+	"sync/atomic"
+	"time"
+
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
 )
 
-
 type Clerk struct {
-	clnt   *tester.Clnt
-	server string
+	clnt     *tester.Clnt
+	server   string
+	clientId int64
+	seq      int64
 }
 
+var globalClientID int64
+
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, server: server}
+	ck := &Clerk{
+		clnt:     clnt,
+		server:   server,
+		clientId: atomic.AddInt64(&globalClientID, 1),
+		seq:      0,
+	}
 	// You may add code here.
 	return ck
 }
@@ -29,8 +40,19 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-	// You will have to modify this function.
-	return "", 0, rpc.ErrNoKey
+	args := &rpc.GetArgs{Key: key}
+
+	for {
+		reply := &rpc.GetReply{}
+		ok := ck.clnt.Call(ck.server, "KVServer.Get", args, reply)
+
+		if ok {
+			return reply.Value, reply.Version, reply.Err
+		}
+
+		// 网络错误，重试
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -51,6 +73,37 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return rpc.ErrNoKey
+	seq := atomic.AddInt64(&ck.seq, 1)
+	args := &rpc.PutArgs{
+		Key:      key,
+		Value:    value,
+		Version:  version,
+		ClientId: ck.clientId,
+		Seq:      seq,
+	}
+
+	firstAttempt := true
+
+	for {
+		reply := &rpc.PutReply{}
+		ok := ck.clnt.Call(ck.server, "KVServer.Put", args, reply)
+
+		if ok {
+			if reply.Err == rpc.OK || reply.Err == rpc.ErrNoKey {
+				return reply.Err
+			}
+
+			if reply.Err == rpc.ErrVersion {
+				if firstAttempt {
+					return rpc.ErrVersion
+				} else {
+					return rpc.ErrMaybe
+				}
+			}
+		}
+
+		// 网络错误或其他错误，重试
+		firstAttempt = false
+		time.Sleep(100 * time.Millisecond)
+	}
 }
