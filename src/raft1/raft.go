@@ -62,7 +62,6 @@ type Raft struct {
 
 	// 条件变量用于applier函数的优化
 	applyCond *sync.Cond
-	applyMu   sync.Mutex // applier专用锁，避免与rf.mu冲突
 
 	// 日志快照压缩
 	lastKzTerm  int
@@ -207,7 +206,6 @@ type ReplySnapshot struct {
 
 // 严重落后的时候传日志
 func (rf *Raft) InstallSnapshot(args *RequestSnapshot, reply *ReplySnapshot) {
-	//但是还是要做检验，万一这个请求很落后呢
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
@@ -226,12 +224,13 @@ func (rf *Raft) InstallSnapshot(args *RequestSnapshot, reply *ReplySnapshot) {
 		rf.ToFollower(args.Term)
 	}
 
-	reply.Success = true
-
 	// 3. 如果快照比当前快照旧，拒绝
 	if args.LastIncludedIndex <= rf.lastKzIndex {
+		reply.Success = true //也当作成功了
 		return
 	}
+
+	reply.Success = true
 
 	// 4. 准备发送快照到 applyCh
 	applyMsg := raftapi.ApplyMsg{
@@ -272,9 +271,6 @@ func (rf *Raft) InstallSnapshot(args *RequestSnapshot, reply *ReplySnapshot) {
 
 	// 8. 持久化
 	rf.persist(args.Data)
-
-	DPrintf("[%d] InstallSnapshot from %d, lastKzIndex=%d, lastKzTerm=%d\n",
-		rf.me, args.LeaderId, rf.lastKzIndex, rf.lastKzTerm)
 
 	// 9. 发送快照到 applyCh（在释放锁之后）
 	go func() {
@@ -323,13 +319,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	//记录心跳时间
 	rf.Heartbeat = time.Now()
-	//比自己低但不是跟随者
-	//if (args.Term > rf.currentTerm || args.Term == rf.currentTerm) && rf.State != -1 {
-	//	rf.ToFollower(args.Term)
-	//}
-	//bug，这样子就不会更新跟随者多term了
 
-	rf.ToFollower(args.Term)
+	// 只有在任期变化时才调用ToFollower，避免不必要的持久化
+	if args.Term > rf.currentTerm {
+		rf.ToFollower(args.Term)
+	} else if rf.State != -1 {
+		// 同任期但状态不是Follower，转为Follower但不持久化
+		rf.State = -1
+	}
 
 	// 检查日志一致性
 	logConsistent := false
@@ -548,57 +545,44 @@ func (rf *Raft) ToLeader() {
 }
 
 func (rf *Raft) applier() {
-	rf.applyMu.Lock()
-	defer rf.applyMu.Unlock()
-
 	for !rf.killed() {
-		// 等待条件：有新的日志需要应用
-		for !rf.killed() {
-			rf.mu.Lock()
-			hasNewLogs := rf.LastApplied < rf.CommitIndex
-			rf.mu.Unlock()
-
-			if hasNewLogs {
-				break // 有新日志，跳出等待循环
-			}
-
-			// 没有新日志，等待条件变量信号
+		rf.mu.Lock()
+		// 等待有新的日志需要应用
+		for rf.LastApplied >= rf.CommitIndex && !rf.killed() {
 			rf.applyCond.Wait()
 		}
 
 		if rf.killed() {
+			rf.mu.Unlock()
 			break
 		}
 
-		// 应用日志
-		rf.mu.Lock()
-		var applyMsg raftapi.ApplyMsg
-		needApply := false
+		// 批量应用日志
+		var applyMsgs []raftapi.ApplyMsg
+		commitIndex := rf.CommitIndex
+		lastKzIndex := rf.lastKzIndex
 
-		if rf.LastApplied < rf.CommitIndex {
+		for rf.LastApplied < commitIndex {
 			rf.LastApplied++
-			// 检查是否在快照范围内（不应该发生，但做防御性检查）
-			if rf.LastApplied <= rf.lastKzIndex {
-				rf.mu.Unlock()
+			if rf.LastApplied <= lastKzIndex {
 				continue
 			}
 
 			logIndex := rf.GetNewIndex(rf.LastApplied)
 			if logIndex >= 0 && logIndex < len(rf.Logs) {
-				applyMsg.CommandValid = true
-				applyMsg.Command = rf.Logs[logIndex].Command
-				applyMsg.CommandIndex = rf.LastApplied // 使用实际索引
-				needApply = true
-				DPrintf("[%d] Applying log entry %d (log array index %d)\n", rf.me, rf.LastApplied, logIndex)
+				applyMsg := raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.Logs[logIndex].Command,
+					CommandIndex: rf.LastApplied,
+				}
+				applyMsgs = append(applyMsgs, applyMsg)
 			}
 		}
 		rf.mu.Unlock()
 
-		if needApply {
-			// 临时释放锁来发送消息，避免死锁
-			rf.applyMu.Unlock()
-			rf.ApplyCh <- applyMsg
-			rf.applyMu.Lock()
+		// 批量发送消息
+		for _, msg := range applyMsgs {
+			rf.ApplyCh <- msg
 		}
 	}
 }
@@ -618,8 +602,12 @@ func (rf *Raft) tryCommit() {
 		return
 	}
 
-	// 从后往前遍历，找到最后一个当前任期的、被多数派复制的日志，有日志压缩和快照就不搞二分了，而且原来的二分少了一个单调性，根据日志一致性，match二维数组呈现山峰
-	for N := rf.GetLastIndexBySna(); N > rf.CommitIndex; N-- {
+	// 从后往前遍历，找到最后一个当前任期的、被多数派复制的日志
+	// 优化：提前计算多数派阈值，减少重复计算
+	majority := len(rf.peers) / 2
+	lastIndex := rf.GetLastIndexBySna()
+
+	for N := lastIndex; N > rf.CommitIndex; N-- {
 		// 检查日志N是否为当前任期
 		logIndex := rf.GetNewIndex(N)
 		if logIndex < 0 || logIndex >= len(rf.Logs) {
@@ -628,13 +616,14 @@ func (rf *Raft) tryCommit() {
 
 		if rf.Logs[logIndex].Term == rf.currentTerm {
 			count := 0
-			for i := 0; i < len(rf.peers); i++ {
+			// 优化：提前终止循环
+			for i := 0; i < len(rf.peers) && count <= majority; i++ {
 				if rf.MatchIndex[i] >= N {
 					count++
 				}
 			}
 
-			if count > len(rf.peers)/2 {
+			if count > majority {
 				rf.CommitIndex = N
 				DPrintf("[%d] Advanced commitIndex to %d (term=%d)\n",
 					rf.me, rf.CommitIndex, rf.Logs[logIndex].Term)
@@ -663,205 +652,169 @@ func (rf *Raft) LeaderAppendEntries() {
 
 	var cnt atomic.Int32
 	cnt.Store(1) // Leader自己算一票
-	timeoutCh := time.After(time.Millisecond * 150)
+	var wg sync.WaitGroup
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
+		wg.Add(1)
 		go func(i int) {
-			needCycle := true
-			for needCycle {
-				if rf.killed() {
-					return
-				}
-				needCycle = false
-				rf.mu.Lock()
-				if rf.State != 1 {
-					rf.mu.Unlock()
-					return
-				}
-				prevLogIndex := rf.NextIndex[i] - 1
-				if prevLogIndex < rf.lastKzIndex { //当跟随者的最后一个小于快照，注意这里的假设是日志一致性，
-					req2 := RequestSnapshot{
-						Term:              rf.currentTerm,
-						LeaderId:          rf.me,
-						LastIncludedIndex: rf.lastKzIndex,
-						LastIncludedTerm:  rf.lastKzTerm,
-						Data:              rf.persister.ReadSnapshot(),
-					}
-					rf.mu.Unlock()
-					var reply2 ReplySnapshot
-					ok := rf.SendSnapshot(i, &req2, &reply2)
-					if ok {
-						rf.mu.Lock()
-						if reply2.Term > rf.currentTerm {
-							rf.ToFollower(reply2.Term)
-							rf.mu.Unlock()
-							return
-						}
-						if reply2.Success {
-							rf.NextIndex[i] = rf.lastKzIndex + 1
-							rf.MatchIndex[i] = rf.lastKzIndex
-							DPrintf("[%d] InstallSnapshot succeeded for %d, MatchIndex=%d\n", rf.me, i, rf.MatchIndex[i])
-
-							// 快照复制成功后，检查是否可以提交新日志（根据日志一致性和落后判断）
-							if rf.CommitIndex < rf.GetLastIndexBySna() {
-								rf.tryCommit()
-							}
-						}
-						rf.mu.Unlock()
-						needCycle = true
-						continue
-					} else { //默认网络断联
-						DPrintf("[%d] SendSnapshot to %d failed (network issue)\n", rf.me, i)
-						break
-					}
-
-				}
-				req := AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  0,
-					Entries:      nil,
-					LeaderCommit: rf.CommitIndex,
-				}
-
-				// 设置 PrevLogTerm
-				if prevLogIndex == rf.lastKzIndex {
-					// 特殊情况：如果prevLogIndex正好是快照的最后一个索引
-					// 使用lastKzTerm而不是虚拟节点的term
-					req.PrevLogTerm = rf.lastKzTerm
-				} else if prevLogIndex >= 0 && prevLogIndex <= rf.GetLastIndexBySna() {
-					req.PrevLogTerm = rf.Logs[rf.GetNewIndex(prevLogIndex)].Term
-				}
-				req.Entries = make([]LogEntry, len(rf.Logs[rf.GetNewIndex(rf.NextIndex[i]):]))
-				copy(req.Entries, rf.Logs[rf.GetNewIndex(rf.NextIndex[i]):])
-				rf.mu.Unlock()
-
-				reply := AppendEntriesReply{}
-				ok := rf.SendAppendEntries(i, &req, &reply)
-				if ok {
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						DPrintf("[%d] Leader stepping down: reply term %d > my term %d\n", rf.me, reply.Term, rf.currentTerm)
-						rf.ToFollower(reply.Term)
-						rf.mu.Unlock()
-						return
-					}
-					if rf.State != 1 {
-						rf.mu.Unlock()
-						return
-					}
-					if reply.Success {
-						cnt.Add(1)
-						rf.NextIndex[i] = prevLogIndex + 1 + len(req.Entries)
-						rf.MatchIndex[i] = rf.NextIndex[i] - 1
-						DPrintf("[%d] Replicated to %d, nextIndex=%d, matchIndex=%d\n", rf.me, i, rf.NextIndex[i], rf.MatchIndex[i])
-
-						// 立即检查是否可以提交新日志
-						if cnt.Load() > int32(len(rf.peers)/2) && rf.CommitIndex < rf.GetLastIndexBySna() {
-							rf.tryCommit()
-						}
-					} else { //跟随者长度过小或者是一致性失败
-						DPrintf("[%d] AppendEntries to %d failed: XTerm=%d, XIndex=%d, XLen=%d, Xlkz=%d\n",
-							rf.me, i, reply.XTerm, reply.XIndex, reply.XLen, reply.Xlkz)
-
-						// 使用快速回退优化
-						if reply.XLen > 0 {
-							// 情况3：follower的日志太短
-							// XLen 是 follower 的日志数组长度，需要转换为实际索引
-							rf.NextIndex[i] = reply.Xlkz + reply.XLen
-
-						} else if reply.XTerm > 0 {
-							// XIndex == 0 表示冲突位置在快照中
-							if reply.XIndex == 0 {
-								// 冲突在快照范围内，发送快照
-								req2 := RequestSnapshot{
-									Term:              rf.currentTerm,
-									LeaderId:          rf.me,
-									LastIncludedIndex: rf.lastKzIndex,
-									LastIncludedTerm:  rf.lastKzTerm,
-									Data:              rf.persister.ReadSnapshot(),
-								}
-								rf.mu.Unlock()
-								var reply2 ReplySnapshot
-								okk := rf.SendSnapshot(i, &req2, &reply2)
-								if okk {
-									rf.mu.Lock()
-									if reply2.Term > rf.currentTerm {
-										rf.ToFollower(reply2.Term)
-										rf.mu.Unlock()
-										return
-									}
-									if reply2.Success {
-										rf.NextIndex[i] = rf.lastKzIndex + 1
-										rf.MatchIndex[i] = rf.lastKzIndex
-									}
-									rf.mu.Unlock()
-									needCycle = true
-									continue
-								} else {
-									DPrintf("[%d] SendSnapshot to %d failed in conflict resolution (network issue)\n", rf.me, i)
-									break
-								}
-							}
-
-							// 查找leader是否有XTerm
-							hasXTerm := false
-							lastXTermIndex := -1
-							// 从后往前查找，遍历日志数组
-							for j := len(rf.Logs) - 1; j >= 1; j-- {
-								if rf.Logs[j].Term == reply.XTerm {
-									hasXTerm = true
-									lastXTermIndex = rf.lastKzIndex + j // 转换为实际索引
-									break
-								}
-								if rf.Logs[j].Term < reply.XTerm {
-									break // 任期更小，不可能找到了
-								}
-							}
-
-							if hasXTerm {
-								// 情况2：leader有XTerm，从该任期最后一个条目+1开始
-								rf.NextIndex[i] = lastXTermIndex + 1
-							} else {
-								// 情况1：leader没有XTerm，从follower的XIndex开始
-								rf.NextIndex[i] = reply.XIndex
-							}
-						}
-
-						DPrintf("[%d] Fast backup: peer %d, new NextIndex=%d (XTerm=%d, XIndex=%d, XLen=%d)\n",
-							rf.me, i, rf.NextIndex[i], reply.XTerm, reply.XIndex, reply.XLen)
-
-						// 这地方应该一定会成立
-						if rf.State == 1 {
-							needCycle = true
-						}
-					}
-					rf.mu.Unlock()
-				} else {
-					// RPC 失败（网络问题或节点崩溃）
-					DPrintf("[%d] AppendEntries RPC to %d failed (network or peer down)\n", rf.me, i)
-				}
-			}
-
+			defer wg.Done()
+			rf.replicateToPeer(i, &cnt)
 		}(i)
 	}
 
-	<-timeoutCh
+	// 等待所有复制完成或超时
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
 
-	DPrintf("[%d] LeaderAppendEntries timeout: cnt=%d, need=%d\n", rf.me, cnt.Load(), len(rf.peers)/2)
+	select {
+	case <-done:
+		// 所有RPC完成
+	case <-time.After(50 * time.Millisecond):
+		// 超时
+	}
 
-	// 超时后再次检查提交（可能有一些RPC还在进行中）
+	// 检查提交
 	rf.mu.Lock()
 	if rf.State == 1 {
-		DPrintf("[%d] Final commit check: CommitIndex=%d, LastIndex=%d, MatchIndex=%v\n",
-			rf.me, rf.CommitIndex, rf.GetLastIndexBySna(), rf.MatchIndex)
 		rf.tryCommit()
 	}
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) replicateToPeer(peer int, cnt *atomic.Int32) {
+	for {
+		if rf.killed() {
+			return
+		}
+
+		rf.mu.Lock()
+		if rf.State != 1 {
+			rf.mu.Unlock()
+			return
+		}
+
+		prevLogIndex := rf.NextIndex[peer] - 1
+
+		// 如果需要发送快照
+		if prevLogIndex < rf.lastKzIndex {
+			snapshotData := rf.persister.ReadSnapshot()
+			req := RequestSnapshot{
+				Term:              rf.currentTerm,
+				LeaderId:          rf.me,
+				LastIncludedIndex: rf.lastKzIndex,
+				LastIncludedTerm:  rf.lastKzTerm,
+				Data:              snapshotData,
+			}
+			rf.mu.Unlock()
+
+			var reply ReplySnapshot
+			ok := rf.SendSnapshot(peer, &req, &reply)
+			if !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				rf.ToFollower(reply.Term)
+				rf.mu.Unlock()
+				return
+			}
+			if reply.Success {
+				rf.NextIndex[peer] = rf.lastKzIndex + 1
+				rf.MatchIndex[peer] = rf.lastKzIndex
+				cnt.Add(1)
+			}
+			rf.mu.Unlock()
+			continue
+		}
+
+		// 准备AppendEntries请求
+		req := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  0,
+			Entries:      nil,
+			LeaderCommit: rf.CommitIndex,
+		}
+
+		// 设置PrevLogTerm
+		if prevLogIndex == rf.lastKzIndex {
+			req.PrevLogTerm = rf.lastKzTerm
+		} else if prevLogIndex >= 0 && prevLogIndex <= rf.GetLastIndexBySna() {
+			req.PrevLogTerm = rf.Logs[rf.GetNewIndex(prevLogIndex)].Term
+		}
+
+		// 复制日志条目
+		if rf.NextIndex[peer] <= rf.GetLastIndexBySna() {
+			req.Entries = make([]LogEntry, len(rf.Logs[rf.GetNewIndex(rf.NextIndex[peer]):]))
+			copy(req.Entries, rf.Logs[rf.GetNewIndex(rf.NextIndex[peer]):])
+		}
+		rf.mu.Unlock()
+
+		reply := AppendEntriesReply{}
+		ok := rf.SendAppendEntries(peer, &req, &reply)
+		if !ok {
+			return
+		}
+
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.ToFollower(reply.Term)
+			rf.mu.Unlock()
+			return
+		}
+		if rf.State != 1 {
+			rf.mu.Unlock()
+			return
+		}
+
+		if reply.Success {
+			cnt.Add(1)
+			rf.NextIndex[peer] = prevLogIndex + 1 + len(req.Entries)
+			rf.MatchIndex[peer] = rf.NextIndex[peer] - 1
+			rf.mu.Unlock()
+			return
+		} else {
+			// 快速回退优化
+			if reply.XLen > 0 {
+				rf.NextIndex[peer] = reply.Xlkz + reply.XLen
+			} else if reply.XTerm > 0 {
+				if reply.XIndex == 0 {
+					// 需要发送快照
+					rf.mu.Unlock()
+					continue
+				}
+
+				// 查找XTerm的最后一个条目
+				hasXTerm := false
+				lastXTermIndex := -1
+				for j := len(rf.Logs) - 1; j >= 1; j-- {
+					if rf.Logs[j].Term == reply.XTerm {
+						hasXTerm = true
+						lastXTermIndex = rf.lastKzIndex + j
+						break
+					}
+					if rf.Logs[j].Term < reply.XTerm {
+						break
+					}
+				}
+
+				if hasXTerm {
+					rf.NextIndex[peer] = lastXTermIndex + 1
+				} else {
+					rf.NextIndex[peer] = reply.XIndex
+				}
+			}
+			rf.mu.Unlock()
+		}
+	}
 }
 
 func (rf *Raft) HeartbeatLoop() {
@@ -871,52 +824,61 @@ func (rf *Raft) HeartbeatLoop() {
 			rf.mu.Unlock()
 			return
 		}
-
-		req := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: rf.GetLastIndexBySna(),
-			PrevLogTerm:  rf.GetLastTermBySna(),
-			Entries:      []LogEntry{},
-			LeaderCommit: rf.CommitIndex,
-		}
 		rf.mu.Unlock()
 
-		DPrintf("[%d] Sending heartbeat, term=%d\n", rf.me, req.Term)
+		// 发送心跳
+		rf.sendHeartbeat()
 
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				continue
-			}
-			go func(i int) {
-				if rf.killed() {
-					return
-				}
-				var reply AppendEntriesReply
-				ok := rf.SendAppendEntries(i, &req, &reply)
-				if ok && !rf.killed() {
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.ToFollower(reply.Term)
-					}
-					rf.mu.Unlock()
-				}
-			}(i)
-		}
+		// 检查是否需要复制日志
 		rf.mu.Lock()
-		// 只有当有新的日志条目需要复制时才触发LeaderAppendEntries,这里考虑要不要去掉,有点多余捏
 		hasNewEntries := false
-		for j := 0; j < len(rf.peers); j++ {
-			if j != rf.me && rf.NextIndex[j] <= rf.GetLastIndexBySna() {
+		lastIndex := rf.GetLastIndexBySna()
+		for j := 0; j < len(rf.peers) && !hasNewEntries; j++ {
+			if j != rf.me && rf.NextIndex[j] <= lastIndex {
 				hasNewEntries = true
-				break
 			}
 		}
 		if hasNewEntries {
 			go rf.LeaderAppendEntries()
 		}
 		rf.mu.Unlock()
-		time.Sleep(75 * time.Millisecond)
+
+		time.Sleep(50 * time.Millisecond) // 减少心跳间隔
+	}
+}
+
+func (rf *Raft) sendHeartbeat() {
+	rf.mu.Lock()
+	lastIndex := rf.GetLastIndexBySna()
+	lastTerm := rf.GetLastTermBySna()
+	req := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: lastIndex,
+		PrevLogTerm:  lastTerm,
+		Entries:      []LogEntry{},
+		LeaderCommit: rf.CommitIndex,
+	}
+	rf.mu.Unlock()
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go func(i int) {
+			if rf.killed() {
+				return
+			}
+			var reply AppendEntriesReply
+			ok := rf.SendAppendEntries(i, &req, &reply)
+			if ok && !rf.killed() {
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.ToFollower(reply.Term)
+				}
+				rf.mu.Unlock()
+			}
+		}(i)
 	}
 }
 
@@ -1022,8 +984,6 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-const electionTimeout = 500 * time.Millisecond
-
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -1039,9 +999,8 @@ func (rf *Raft) ticker() {
 		}
 		rf.mu.Unlock()
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		// pause for a random amount of time between 30 and 100 milliseconds
+		ms := 30 + (rand.Int63() % 70)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -1066,15 +1025,19 @@ func (rf *Raft) startElection() {
 	var cnt atomic.Int32
 	cnt.Store(1) // 给自己投票
 	WinNeed := int32(len(rf.peers) / 2)
-	timeoutCh := time.After(time.Duration(500) * time.Millisecond) // 选举过程超时
+	timeoutCh := time.After(time.Duration(200) * time.Millisecond) // 减少选举超时时间
 	resultCh := make(chan bool, 1)
+
+	// 使用WaitGroup确保所有goroutine完成
+	var wg sync.WaitGroup
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
+		wg.Add(1)
 		go func(i int) {
-			// 检查节点是否已经被kill
+			defer wg.Done()
 			if rf.killed() {
 				return
 			}
@@ -1083,27 +1046,23 @@ func (rf *Raft) startElection() {
 			if ok && !rf.killed() {
 				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
-					rf.mu.Unlock()
 					rf.ToFollower(reply.Term)
-					// 通知选举终止
+					rf.mu.Unlock()
 					select {
 					case resultCh <- false:
 					default:
 					}
 					return
 				}
-				// 确保我们仍在同一任期的选举中
 				if rf.State != 0 || rf.currentTerm != currentElectionTerm {
 					rf.mu.Unlock()
-					return // 状态已改变，忽略此回复
+					return
 				}
 				rf.mu.Unlock()
 
 				if reply.VoteGranted {
-					cnt.Add(1)
-					newCount := cnt.Load()
+					newCount := cnt.Add(1)
 					if newCount > WinNeed {
-						// 通知选举成功
 						select {
 						case resultCh <- true:
 						default:
@@ -1113,6 +1072,16 @@ func (rf *Raft) startElection() {
 			}
 		}(i)
 	}
+
+	// 启动一个goroutine等待所有RPC完成
+	go func() {
+		wg.Wait()
+		// 如果超时前所有RPC都完成了，但没有获得足够票数，发送失败信号
+		select {
+		case resultCh <- false:
+		default:
+		}
+	}()
 
 	select {
 	case won := <-resultCh:
@@ -1124,10 +1093,7 @@ func (rf *Raft) startElection() {
 			rf.mu.Unlock()
 		}
 	case <-timeoutCh:
-		rf.mu.Lock()
-		currentTerm := rf.currentTerm
-		rf.mu.Unlock()
-		DPrintf("[%d] Election timeout, term=%d\n", rf.me, currentTerm)
+		DPrintf("[%d] Election timeout, term=%d\n", rf.me, currentElectionTerm)
 	}
 }
 
@@ -1166,7 +1132,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.data = nil
 
 	// 初始化条件变量
-	rf.applyCond = sync.NewCond(&rf.applyMu)
+	rf.applyCond = sync.NewCond(&rf.mu)
 
 	rf.Heartbeat = time.Now()
 	rf.ElectionTimeout = time.Duration(150+rand.Intn(150)) * time.Millisecond
@@ -1183,7 +1149,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// 如果有持久化的快照数据，发送到服务层恢复状态
 	snapshot := persister.ReadSnapshot()
-	if snapshot != nil && len(snapshot) > 0 && rf.lastKzIndex > 0 {
+	if len(snapshot) > 0 && rf.lastKzIndex > 0 {
 		go func() {
 			rf.ApplyCh <- raftapi.ApplyMsg{
 				SnapshotValid: true,
