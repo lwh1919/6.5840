@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"sync"
 	"sync/atomic"
 
@@ -11,6 +12,8 @@ import (
 	tester "6.5840/tester1"
 )
 
+// 对外：它是一个服务端，处理客户端的Get/Put请求
+// 对内：它是RSM框架中的StateMachine（状态机）
 type KVServer struct {
 	me   int
 	dead int32 // set by Kill()
@@ -126,12 +129,54 @@ func (kv *KVServer) DoOp(req any) any {
 }
 
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// 创建快照数据结构
+	snapshot := struct {
+		KeyValue map[string]string
+		Versions map[string]rpc.Tversion
+		LastOps  map[int64]lastOperation
+	}{
+		KeyValue: kv.keyValue,
+		Versions: kv.versions,
+		LastOps:  kv.lastOps,
+	}
+
+	// 序列化
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(snapshot)
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here
+	if len(data) == 0 {
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// 反序列化
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var snapshot struct {
+		KeyValue map[string]string
+		Versions map[string]rpc.Tversion
+		LastOps  map[int64]lastOperation
+	}
+
+	if d.Decode(&snapshot) != nil {
+		// 处理错误
+		return
+	}
+
+	// 恢复状态
+	kv.keyValue = snapshot.KeyValue
+	kv.versions = snapshot.Versions
+	kv.lastOps = snapshot.LastOps
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {

@@ -210,6 +210,15 @@ type ReplySnapshot struct {
 	Success bool
 }
 
+// 处理Leader发送的快照安装请求：
+// 任期检查，拒绝过期请求
+// 更新心跳时间，防止选举超时
+// 如果任期更新，转为Follower
+// 检查快照是否比当前快照新
+// 根据日志匹配情况处理现有日志
+// 更新快照状态和提交索引
+// 持久化新状态
+// 异步发送快照到应用层
 // 严重落后的时候传日志
 func (rf *Raft) InstallSnapshot(args *RequestSnapshot, reply *ReplySnapshot) {
 	//但是还是要做检验，万一这个请求很落后呢
@@ -245,6 +254,7 @@ func (rf *Raft) InstallSnapshot(args *RequestSnapshot, reply *ReplySnapshot) {
 		Snapshot:      args.Data,
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
+		CommandValid:  true,
 	}
 
 	// 5. 根据情况处理日志

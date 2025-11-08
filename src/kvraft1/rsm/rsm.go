@@ -105,18 +105,61 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
-
+	// 恢复快照（如果存在）
+	if maxraftstate != -1 {
+		snapshot := persister.ReadSnapshot()
+		if len(snapshot) > 0 {
+			rsm.sm.Restore(snapshot)
+		}
+	}
 	go rsm.reader()
 
 	return rsm
 }
+func (rsm *RSM) handleSnapshot(msg raftapi.ApplyMsg) {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+
+	// 更新lastApplied
+	if msg.SnapshotIndex > rsm.lastApplied {
+		rsm.lastApplied = msg.SnapshotIndex
+
+		// 清理过期的等待通道
+		for index := range rsm.mapChan {
+			if index <= msg.SnapshotIndex {
+				delete(rsm.mapChan, index)
+			}
+		}
+
+		// 恢复状态机状态
+		rsm.sm.Restore(msg.Snapshot)
+	}
+}
+
+func (rsm *RSM) checkSnapshot(appliedIndex int) {
+	if rsm.maxraftstate == -1 {
+		return // 不需要快照
+	}
+
+	// 检查Raft状态大小
+	if rsm.rf.PersistBytes() >= rsm.maxraftstate {
+		// 创建快照
+		snapshot := rsm.sm.Snapshot()
+		rsm.rf.Snapshot(appliedIndex, snapshot)
+	}
+}
 
 func (rsm *RSM) reader() {
 	for msg := range rsm.applyCh { //go特色语法糖
+
 		if !msg.CommandValid {
 			continue
 		}
-
+		if msg.SnapshotValid {
+			// 处理快照消息
+			rsm.handleSnapshot(msg)
+			continue
+		}
 		op, ok := msg.Command.(Op)
 		if !ok {
 			continue
@@ -153,6 +196,8 @@ func (rsm *RSM) reader() {
 			}
 			opres.ResultCh <- ressult
 		}
+		// 检查是否需要创建快照
+		rsm.checkSnapshot(msg.CommandIndex)
 	}
 }
 
@@ -223,7 +268,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 			}
 
 		case <-timeout:
-			// 超时：清理并返回错误
+			// 防止超长测试的goroutine超时
 			rsm.mu.Lock()
 			delete(rsm.mapChan, index)
 			rsm.mu.Unlock()
