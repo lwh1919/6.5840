@@ -6,8 +6,9 @@ import (
 )
 
 type FreezeShardArgs struct {
-	Shard shardcfg.Tshid
-	Num   shardcfg.Tnum
+	Shard     shardcfg.Tshid
+	Num       shardcfg.Tnum
+	Shard2Gid map[int]int
 }
 
 type FreezeShardReply struct {
@@ -17,9 +18,10 @@ type FreezeShardReply struct {
 }
 
 type InstallShardArgs struct {
-	Shard shardcfg.Tshid
-	State []byte
-	Num   shardcfg.Tnum
+	Shard     shardcfg.Tshid
+	State     []byte
+	Num       shardcfg.Tnum
+	Shard2Gid map[int]int
 }
 
 type InstallShardReply struct {
@@ -27,8 +29,9 @@ type InstallShardReply struct {
 }
 
 type DeleteShardArgs struct {
-	Shard shardcfg.Tshid
-	Num   shardcfg.Tnum
+	Shard     shardcfg.Tshid
+	Num       shardcfg.Tnum
+	Shard2Gid map[int]int
 }
 
 type DeleteShardReply struct {
