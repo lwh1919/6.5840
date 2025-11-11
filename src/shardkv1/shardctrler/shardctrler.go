@@ -12,6 +12,7 @@ import (
 )
 
 const configKey = "shardctrler/config"
+const nextConfigKey = "shardctrler/next_config"
 
 type ShardCtrler struct {
 	clnt            *tester.Clnt //
@@ -34,7 +35,26 @@ func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 // controller. In part A, this method doesn't need to do anything. In
 // B and C, this method implements recovery.
 func (sck *ShardCtrler) InitController() {
+	current := sck.Query()
+	next := sck.QueryNext()
 
+	if next != nil && current != nil && next.Num > current.Num {
+		sck.performMigration(current, next)
+
+		version := rpc.Tversion(current.Num)
+
+		for i := 0; i < 50; i++ {
+			if putErr := sck.Put(configKey, next.String(), version); putErr == rpc.OK {
+				sck.clearNextConfig()
+				return
+			}
+			if i < 10 {
+				time.Sleep(10 * time.Millisecond)
+			} else {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}
 }
 
 // Called once by the tester to supply the first configuration.  You
@@ -47,12 +67,10 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 		return
 	}
 
-	// Retry InitConfig in case of network failures
 	for i := 0; ; i++ {
 		if err := sck.Put(configKey, cfg.String(), 0); err == rpc.OK {
 			return
 		}
-		// Retry on failure with exponential backoff
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -72,7 +90,97 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		return
 	}
 
+	sck.clearNextConfig()
+
+	if !sck.putNextConfig(new) {
+		return
+	}
+
+	sck.performMigration(old, new)
+
 	version := rpc.Tversion(old.Num)
+
+	//存储新的配置
+	for i := 0; i < 50; i++ {
+		if putErr := sck.Put(configKey, new.String(), version); putErr == rpc.OK {
+			sck.clearNextConfig()
+			return
+		}
+		if i < 10 {
+			time.Sleep(10 * time.Millisecond)
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
+// Return the current configuration
+func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
+	value, _, err := sck.Get(configKey)
+	if err != rpc.OK {
+		return shardcfg.MakeShardConfig()
+	}
+
+	return shardcfg.FromString(value)
+}
+
+// Return the next configuration if it exists
+func (sck *ShardCtrler) QueryNext() *shardcfg.ShardConfig {
+	value, _, err := sck.Get(nextConfigKey)
+	if err != rpc.OK || value == "" {
+		return nil
+	}
+
+	return shardcfg.FromString(value)
+}
+
+// Store the next configuration
+func (sck *ShardCtrler) putNextConfig(cfg *shardcfg.ShardConfig) bool {
+	if cfg == nil {
+		return false
+	}
+
+	cfgStr := cfg.String()
+
+	for i := 0; i < 20; i++ {
+		_, version, getErr := sck.Get(nextConfigKey)
+		var putErr rpc.Err
+
+		if getErr == rpc.ErrNoKey {
+			putErr = sck.Put(nextConfigKey, cfgStr, 0)
+		} else if getErr == rpc.OK {
+			putErr = sck.Put(nextConfigKey, cfgStr, version)
+		} else {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+
+		if putErr == rpc.OK {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+func (sck *ShardCtrler) clearNextConfig() {
+	for i := 0; i < 20; i++ {
+		_, version, getErr := sck.Get(nextConfigKey)
+		if getErr == rpc.ErrNoKey {
+			return
+		} else if getErr == rpc.OK {
+			if err := sck.Put(nextConfigKey, "", version); err == rpc.OK {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (sck *ShardCtrler) performMigration(old, new *shardcfg.ShardConfig) {
+	if old == nil || new == nil {
+		return
+	}
 
 	type migration struct {
 		shard  int
@@ -88,7 +196,6 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		shard2gid[i] = int(gid)
 	}
 
-	//遍历所有shard，判断是否需要迁移
 	for shard := 0; shard < shardcfg.NShards; shard++ {
 		oldGid := old.Shards[shard]
 		newGid := new.Shards[shard]
@@ -102,7 +209,6 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		}
 	}
 
-	//遍历所有需要迁移的shard，冻结shard
 	for i := range migrations {
 		m := &migrations[i]
 		if m.oldGid != 0 {
@@ -120,7 +226,6 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		}
 	}
 
-	//遍历所有需要迁移的shard，安装shard
 	for _, m := range migrations {
 		if m.newGid != 0 {
 			if servers, exists := new.Groups[m.newGid]; exists {
@@ -134,14 +239,12 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 					if err == rpc.OK {
 						break
 					}
-					// Retry on failure with backoff
 					time.Sleep(time.Duration(retry*10) * time.Millisecond)
 				}
 			}
 		}
 	}
 
-	//遍历所有需要迁移的shard，删除shard
 	for _, m := range migrations {
 		if m.oldGid != 0 {
 			if servers, exists := old.Groups[m.oldGid]; exists {
@@ -151,33 +254,9 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 					if err == rpc.OK {
 						break
 					}
-					// Retry on failure with backoff
 					time.Sleep(time.Duration(retry*10) * time.Millisecond)
 				}
 			}
 		}
 	}
-
-	//存储新的配置
-	for i := 0; i < 50; i++ {
-		if putErr := sck.Put(configKey, new.String(), version); putErr == rpc.OK {
-			return
-		}
-		// Retry on failure with exponential backoff
-		if i < 10 {
-			time.Sleep(10 * time.Millisecond)
-		} else {
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-}
-
-// Return the current configuration
-func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
-	value, _, err := sck.Get(configKey)
-	if err != rpc.OK {
-		return shardcfg.MakeShardConfig()
-	}
-
-	return shardcfg.FromString(value)
 }

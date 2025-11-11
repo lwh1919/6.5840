@@ -71,6 +71,8 @@ func (kv *KVServer) DoOp(req any) any {
 		requestId = args.Seq
 		clientId = args.ClientId
 	case *rpc.GetArgs:
+		//记录仅用于“去重写请求”
+		//lastOps 用来防止 Put 被重复执行——不管是客户端因为超时重发相同的 Put，还是 Raft 在崩溃恢复时重放已提交日志，写请求都可能再次进入状态机。如果不做去重，旧请求会覆盖新值，破坏一致性。缓存 Put 的结果就能保证“同一请求只生效一次”。
 		//Get操作不需要幂等性检查
 	case rpc.GetArgs:
 		//Get操作不需要幂等性检查
@@ -181,18 +183,26 @@ func (kv *KVServer) isNotThisGroup(key string) bool {
 	gid, exists := kv.shard2gid[shard]
 	if !exists {
 		// 如果没有任何映射，则假设这个group负责（用于初始化）
-		return false
+		//为避免分片迁移期间的错写/脏读，建议缺映射默认拒绝，或至少只在明确的初始化场景下放行。
+		return true
 	}
 	return gid != int(kv.gid)
 }
 
 func (kv *KVServer) doFreezeShardInternal(args *shardrpc.FreezeShardArgs) *shardrpc.FreezeShardReply {
 	// 幂等性检查
+	//Idempotency: applying the same operation multiple times has the same effect as applying it once.
+	//直观理解：重复执行不会产生额外副作用；重放/重试是安全的。
+	//容忍客户端/网络重试：RPC 超时后重发相同 FreezeShard(num) 不会重复复制或生成不同的状态；直接返回上次的结果。
+	// 容忍共识层日志重放：崩溃恢复时同一条日志再次执行，也不会改变系统状态（不会多次 bump 计数、不会重复删/装/冻）。
+	// 提供“至少一次”语义的安全落地：即便同一请求多次到达，最终状态一致，且返回结果可预测（相同 num 返回相同值，旧 num 直接 OK）。
 	if lastNum, ok := kv.lastFreezeNum[int(args.Shard)]; ok && lastNum >= int(args.Num) {
-		kv.shard2gid = args.Shard2Gid //疑惑：为什么需要更新shard2gid？
+
 		if lastNum == int(args.Num) {
+			kv.shard2gid = args.Shard2Gid
 			return &shardrpc.FreezeShardReply{Err: rpc.OK, State: kv.lastFreezeState[int(args.Shard)], Num: shardcfg.Tnum(lastNum)}
 		}
+		//因为这是一个“旧配置号”的请求，不能也没必要发送旧数据。返回空数据并带上当前最新的 Num，提示对端“你落后了，请按新配置迁移”。
 		return &shardrpc.FreezeShardReply{Err: rpc.OK, State: []byte{}, Num: shardcfg.Tnum(lastNum)}
 	}
 

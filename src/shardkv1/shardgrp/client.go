@@ -52,6 +52,7 @@ func (ck *Clerk) setLeader(leader int) {
 	ck.leader = leader
 }
 
+// Get不检查version是因为它只是读取当前最新状态，而Put需要version检查来防止过时更新。线性一致性通过RSM的日志复制和顺序执行机制来保证，而不是通过Get操作的version检查。
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	args := &rpc.GetArgs{Key: key}
 
@@ -114,6 +115,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 					if firstAttempt {
 						return rpc.ErrVersion
 					}
+					//一旦我们遇到超时、重定向或网络失败，就会把 firstAttempt 置为 false，随后再次收到的 ErrVersion 就说明“状态变了，但到底是我们之前的某次请求成功了，还是别人写入了，无法确认”，只能返回 ErrMaybe。这和线性一致性不冲突，属于客户端对“请求是否已经执行过”的不确定性处理。
 					return rpc.ErrMaybe
 				case rpc.ErrWrongLeader:
 					firstAttempt = false
